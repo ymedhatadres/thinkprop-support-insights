@@ -1,0 +1,9 @@
+data/
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# Internal research material — never publish to the public repo
+*.docx
+*.xlsx
