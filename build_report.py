@@ -29,6 +29,10 @@ from lib.themes import classify  # noqa: E402
 PARQUET = Path(__file__).parent / "data" / "tickets.parquet"
 OUT_HTML = Path(__file__).parent / "docs" / "index.html"
 
+# Public deploy location — used for absolute Open Graph / Twitter card URLs.
+SITE_URL = "https://ymedhatadres.github.io/thinkprop-support-insights/"
+OG_IMAGE = SITE_URL + "og-image.png"   # ThinkProp icon (501x501), served from docs/
+
 
 # ----------------------------------------------------------------------------
 # PII redaction
@@ -1012,12 +1016,36 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
     logo_svg = logo_path.read_text(encoding="utf-8") if logo_path.exists() else ""
     title = "ThinkProp — Support Insights"
 
+    # Social-share (Open Graph / Twitter) metadata. Image reuses ThinkProp's own
+    # brand icon (downloaded to docs/og-image.png), matching the main site.
+    d = all_data.get(default_key) or next(iter(all_data.values()))
+    og_desc = html.escape(
+        f"What learners contact ThinkProp about, which courses carry the most "
+        f"load, and the highest-impact product fixes. {d['period']}: "
+        f"{d['total']:,} tickets · {d['n_users']:,} learners."
+    )
+    og = f"""
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="ADRES UX Research">
+  <meta property="og:title" content="ThinkProp Support Insights">
+  <meta property="og:description" content="{og_desc}">
+  <meta property="og:url" content="{SITE_URL}">
+  <meta property="og:image" content="{OG_IMAGE}">
+  <meta property="og:image:width" content="501">
+  <meta property="og:image:height" content="501">
+  <meta property="og:image:alt" content="ThinkProp">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="ThinkProp Support Insights">
+  <meta name="twitter:description" content="{og_desc}">
+  <meta name="twitter:image" content="{OG_IMAGE}">"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
+  <meta name="description" content="{og_desc}">{og}
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
   <style>{css}</style>
 </head>
