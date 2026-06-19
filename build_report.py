@@ -227,6 +227,58 @@ PAIN_CATEGORIES = {
 # Categories that represent real, narratable pain (excludes the catch-all).
 PAIN_KEYS = [k for k in PAIN_CATEGORIES if k != "other"]
 
+
+# ----------------------------------------------------------------------------
+# Verticals — ThinkProp's product lines. Derived from the course name
+# (cf_service), corroborated by the ThinkProp / ThinkProp-ENG product flag.
+# ----------------------------------------------------------------------------
+
+VERTICALS = {
+    "real_estate": {
+        "label": "Real Estate",
+        "color": "#0c838f", "bg": "#e1f0f1",
+        "blurb": "Core licensing — brokerage, valuation, surveying, property management, AML.",
+    },
+    "engineering": {
+        "label": "Engineering",
+        "color": "#f25f5c", "bg": "#fdecec",
+        "blurb": "TP Engineering — civil, structural, architecture & mechanical courses and exams.",
+    },
+    "ai": {
+        "label": "AI Academy",
+        "color": "#5b5fc7", "bg": "#ecedf9",
+        "blurb": "AI upskilling — AI Mastery for Real Estate Professionals.",
+    },
+    "other": {
+        "label": "Other",
+        "color": "#9aa0a6", "bg": "#eceef0",
+        "blurb": "Instructor applications, partnerships, and unclassified contact.",
+    },
+}
+VERTICAL_ORDER = ["real_estate", "engineering", "ai", "other"]
+
+_ENG_KW = re.compile(r"engineer|structural|architect|mechanical|civil|apsam|project submission", re.I)
+_RE_KW = re.compile(r"broker|valuation|survey|secondary sales|money laundering|"
+                    r"property management|irem|rera|real estate", re.I)
+
+
+def assign_vertical(service, product) -> str:
+    """Classify a ticket into a ThinkProp vertical from its course + product."""
+    s = "" if service is None or (isinstance(service, float) and pd.isna(service)) else str(service)
+    if s in ("<NA>", "nan", "None"):
+        s = ""
+    p = "" if product is None or (isinstance(product, float) and pd.isna(product)) else str(product)
+    sl = s.lower()
+    # AI must be checked first ("AI Mastery for Real Estate Professionals" also
+    # contains "real estate"). Match the standalone token "AI", not substrings.
+    if "ai mastery" in sl or re.search(r"\bAI\b", s):
+        return "ai"
+    if "ENG" in p or _ENG_KW.search(s):
+        return "engineering"
+    if _RE_KW.search(s):
+        return "real_estate"
+    return "other"
+
 # Keywords used to pull the most salient sentence per inquiry type.
 THEME_KEYWORDS = {
     "Registration Process": ["register", "registration", "enrol", "enroll", "sign up",
@@ -272,7 +324,17 @@ THEME_KEYWORDS = {
 def load_full() -> pd.DataFrame:
     df = pd.read_parquet(PARQUET)
     df = classify(df)
-    return df.loc[~df["is_noise"]].reset_index(drop=True)
+    df = df.loc[~df["is_noise"]].reset_index(drop=True)
+    svc = df.get("custom_fields.cf_service")
+    prod = df.get("custom_fields.cf_products")
+    df["vertical"] = [
+        assign_vertical(s, p)
+        for s, p in zip(
+            svc if svc is not None else [None] * len(df),
+            prod if prod is not None else [None] * len(df),
+        )
+    ]
+    return df
 
 
 def load_period(month: str | None, quarter: str | None,
@@ -300,35 +362,53 @@ def load_period(month: str | None, quarter: str | None,
     return sub, label
 
 
-def build_all_months(min_size: int = 50) -> tuple[dict, list[tuple[str, str]], str]:
-    """Build one DATA block per month + an 'all' block.
+def _build_month_blocks(all_data: dict, mdf: pd.DataFrame, mkey: str, label: str) -> None:
+    """Build the 'all verticals' block + one block per vertical for a month.
 
-    Returns (all_data_dict, options_list, default_month_key).
-    options_list is [(key, label), ...] ordered with the most recent month first
-    and 'all' last — suitable for the <select> dropdown directly.
+    Keys are composite: "<month>::<vertical>" (vertical 'all' == every vertical).
+    Empty vertical subsets are skipped (the UI falls back to 'all').
+    """
+    vsum = build_verticals_summary(mdf)
+    all_data[f"{mkey}::all"] = build_data(mdf, label, vsum, "all", "All verticals")
+    for vk in VERTICAL_ORDER:
+        sub = mdf[mdf["vertical"] == vk].reset_index(drop=True)
+        if sub.empty:
+            continue
+        all_data[f"{mkey}::{vk}"] = build_data(sub, label, vsum, vk, VERTICALS[vk]["label"])
+
+
+def build_all_months(min_size: int = 50):
+    """Build one DATA block per (month × vertical) + an 'all months' set.
+
+    Returns (all_data, month_options, vertical_options, default_key).
+    Keys in all_data are "<month>::<vertical>". default_key opens on the latest
+    month, all verticals.
     """
     df = load_full()
     counts = df["created_month"].value_counts().sort_index()
     months = [m for m in counts.index if counts[m] >= min_size]
 
     all_data: dict[str, dict] = {}
-    options: list[tuple[str, str]] = []
+    month_options: list[tuple[str, str]] = []
 
     for m in reversed(months):  # latest first
-        sub = df[df["created_month"] == m].reset_index(drop=True)
+        mdf = df[df["created_month"] == m].reset_index(drop=True)
         label = pd.to_datetime(m).strftime("%B %Y")
-        all_data[m] = build_data(sub, label)
-        options.append((m, label))
+        _build_month_blocks(all_data, mdf, m, label)
+        month_options.append((m, label))
 
-    # "All" view — only worth showing once there is more than one month.
+    # "All months" set — only worth showing once there is more than one month.
     if len(months) > 1:
         all_label = (f"All months ({df['created_at'].min():%b %Y} – "
                      f"{df['created_at'].max():%b %Y})")
-        all_data["all"] = build_data(df, all_label)
-        options.append(("all", all_label))
+        _build_month_blocks(all_data, df, "all", all_label)
+        month_options.append(("all", all_label))
 
-    default_key = options[0][0]  # latest month
-    return all_data, options, default_key
+    vertical_options = [("all", "All verticals")] + [
+        (vk, VERTICALS[vk]["label"]) for vk in VERTICAL_ORDER
+    ]
+    default_key = f"{month_options[0][0]}::all"
+    return all_data, month_options, vertical_options, default_key
 
 
 def ticket_category(row: pd.Series) -> str | None:
@@ -364,7 +444,54 @@ def pick_quote(sub: pd.DataFrame, theme: str | None) -> tuple[str | None, int | 
     return None, None
 
 
-def build_data(df: pd.DataFrame, period_label: str) -> dict:
+def build_verticals_summary(month_df: pd.DataFrame) -> list[dict]:
+    """Per-vertical comparison for a full month (independent of any filter)."""
+    df = month_df.copy()
+    df["category"] = df.apply(ticket_category, axis=1)
+    total = len(df)
+    cat_keys = list(PAIN_CATEGORIES.keys())
+    rows = []
+    for vk in VERTICAL_ORDER:
+        sub = df[df["vertical"] == vk]
+        n = len(sub)
+        cfg = VERTICALS[vk]
+        if n == 0:
+            rows.append({
+                "key": vk, "label": cfg["label"], "color": cfg["color"],
+                "bg": cfg["bg"], "blurb": cfg["blurb"], "tickets": 0, "pct": 0,
+                "users": 0, "avg_sentiment": None, "top_course": "—",
+                "top_course_n": 0, "top_issue": "—", "top_issue_n": 0,
+                "top_cat_key": None, "top_cat_title": "—",
+                "breakdown": {k: 0 for k in cat_keys},
+            })
+            continue
+        svc = sub["custom_fields.cf_service"].dropna().value_counts()
+        themes = sub["theme_primary"].value_counts()
+        breakdown = {k: int((sub["category"] == k).sum()) for k in cat_keys}
+        top_cat_key = max(PAIN_KEYS, key=lambda k: breakdown.get(k, 0))
+        rows.append({
+            "key": vk, "label": cfg["label"], "color": cfg["color"],
+            "bg": cfg["bg"], "blurb": cfg["blurb"],
+            "tickets": n,
+            "pct": round(n / total * 100, 1) if total else 0,
+            "users": int(sub["requester.email"].nunique()),
+            "avg_sentiment": round(float(sub["sentiment_score"].mean()), 1)
+                if sub["sentiment_score"].notna().any() else None,
+            "top_course": (svc.index[0] if not svc.empty else "—"),
+            "top_course_n": int(svc.iloc[0]) if not svc.empty else 0,
+            "top_issue": (themes.index[0] if not themes.empty else "—"),
+            "top_issue_n": int(themes.iloc[0]) if not themes.empty else 0,
+            "top_cat_key": top_cat_key,
+            "top_cat_title": PAIN_CATEGORIES[top_cat_key]["title"],
+            "breakdown": breakdown,
+        })
+    return rows
+
+
+def build_data(df: pd.DataFrame, period_label: str,
+               verticals_summary: list[dict] | None = None,
+               vertical_key: str = "all",
+               vertical_label: str = "All verticals") -> dict:
     df = df.copy()
     df["category"] = df.apply(ticket_category, axis=1)
 
@@ -671,6 +798,9 @@ def build_data(df: pd.DataFrame, period_label: str) -> dict:
         "recommendations": recommendations,
         "trends": trends,
         "tickets": tickets,
+        "verticals_summary": verticals_summary or [],
+        "vertical_key": vertical_key,
+        "vertical_label": vertical_label,
     }
 
 
@@ -898,6 +1028,17 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
   text-transform: uppercase; letter-spacing: 0.04em;
 }
 /*__CAT_PILLS__*/
+/* ---- Vertical chips & filter buttons ---- */
+.vchip {
+  display: inline-block; padding: 3px 10px; border-radius: 6px;
+  font-size: 12px; font-weight: 700; white-space: nowrap;
+}
+.vfilter-btn {
+  margin-top: 14px; background: #fff; border: 1px solid;
+  border-radius: 8px; padding: 7px 14px; font-size: 12px; font-weight: 700;
+  font-family: inherit; cursor: pointer; transition: background .15s;
+}
+.vfilter-btn:hover { background: var(--bg); }
 .pill.priority-high      { background: var(--red-bg);    color: var(--red); }
 .pill.priority-medium    { background: var(--orange-bg); color: var(--orange); }
 .pill.priority-low       { background: var(--green-bg);  color: var(--green); }
@@ -998,12 +1139,16 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 # ---- HTML body shell ----
 
-def render_html(all_data: dict, options: list[tuple[str, str]],
-                default_key: str) -> str:
+def render_html(all_data: dict, month_options: list[tuple[str, str]],
+                vertical_options: list[tuple[str, str]], default_key: str) -> str:
     json_all = json.dumps(all_data, ensure_ascii=False, default=str)
     options_html = "\n".join(
         f'<option value="{html.escape(k)}">{html.escape(label)}</option>'
-        for k, label in options
+        for k, label in month_options
+    )
+    vert_options_html = "\n".join(
+        f'<option value="{html.escape(k)}">{html.escape(label)}</option>'
+        for k, label in vertical_options
     )
     # Inject pill colours generated from the live category palette.
     cat_pills = "\n".join(
@@ -1068,6 +1213,8 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
     <div class="month-picker">
       <label for="monthPicker">Reporting period</label>
       <select id="monthPicker">{options_html}</select>
+      <label for="vertPicker" style="margin-left:16px;">Vertical</label>
+      <select id="vertPicker">{vert_options_html}</select>
     </div>
 
     <div class="kpi-grid">
@@ -1103,6 +1250,7 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
 <nav class="tabs">
   <div class="container">
     <button class="tab-btn active" data-tab="exec">Executive Summary</button>
+    <button class="tab-btn" data-tab="verticals">Verticals</button>
     <button class="tab-btn" data-tab="topissues">Top Issues</button>
     <button class="tab-btn" data-tab="services">Most Affected Courses</button>
     <button class="tab-btn" data-tab="distribution">Issue Distribution</button>
@@ -1137,8 +1285,31 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
     </div>
   </section>
 
+  <section id="verticals" class="tab-content">
+    <h2>2. ThinkProp Verticals</h2>
+    <p class="section-sub">How support load splits across ThinkProp's product
+    lines — Real Estate (core licensing), Engineering, AI Academy, and Other.
+    Use the <strong>Vertical</strong> filter in the header to drill the entire
+    report into any single line.</p>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Tickets by vertical</h3>
+        <div class="chart-container"><canvas id="vertChart"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Pain-category mix per vertical</h3>
+        <div class="chart-container"><canvas id="vertCatChart"></canvas></div>
+      </div>
+    </div>
+    <div id="verticalsCards" style="margin-top:18px;"></div>
+    <div class="card" style="margin-top:18px;">
+      <h3>Full breakdown</h3>
+      <div id="verticalsTable"></div>
+    </div>
+  </section>
+
   <section id="topissues" class="tab-content">
-    <h2>2. Top Issues Affecting Learners</h2>
+    <h2>3. Top Issues Affecting Learners</h2>
     <p class="section-sub">The 10 most frequent inquiry types, ranked by volume.
     Each card explains what is happening, the pain category it belongs to, and
     provides example ticket IDs and a redacted learner quote for verification.</p>
@@ -1146,14 +1317,14 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
   </section>
 
   <section id="services" class="tab-content">
-    <h2>3. Most Affected Courses</h2>
+    <h2>4. Most Affected Courses</h2>
     <p class="section-sub">The five ThinkProp courses receiving the heaviest
     support load, with the specific issues driving each.</p>
     <div id="topServicesContainer"></div>
   </section>
 
   <section id="distribution" class="tab-content">
-    <h2>4. Issue Distribution Across Courses</h2>
+    <h2>5. Issue Distribution Across Courses</h2>
     <p class="section-sub">How learner issues spread across different ThinkProp
     courses, with the share each pain category takes inside each course.</p>
     <div class="grid-2">
@@ -1173,7 +1344,7 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
   </section>
 
   <section id="painpoints" class="tab-content">
-    <h2>5. Recurring Learner Pain Points</h2>
+    <h2>6. Recurring Learner Pain Points</h2>
     <p class="section-sub">The recurring patterns that explain why learners
     contact support. Each card includes the underlying behaviour, why it is
     happening, what would fix it, and example ticket IDs.</p>
@@ -1181,7 +1352,7 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
   </section>
 
   <section id="operational" class="tab-content">
-    <h2>6. Operational Observations</h2>
+    <h2>7. Operational Observations</h2>
     <p class="section-sub">Patterns about how support runs — channel mix, product
     coverage, and tagging quality — that shape how to act on everything above,
     rather than learner pain points in themselves.</p>
@@ -1189,21 +1360,21 @@ def render_html(all_data: dict, options: list[tuple[str, str]],
   </section>
 
   <section id="trends" class="tab-content">
-    <h2>7. Key Trends &amp; Observations</h2>
+    <h2>8. Key Trends &amp; Observations</h2>
     <p class="section-sub">High-level patterns worth surfacing to leadership
     in addition to the headline metrics.</p>
     <div id="trendsContainer"></div>
   </section>
 
   <section id="recommendations" class="tab-content">
-    <h2>8. Recommendations &amp; Opportunities</h2>
+    <h2>9. Recommendations &amp; Opportunities</h2>
     <p class="section-sub">Prioritised actions linked to the underlying pain
     points, with addressable-ticket counts as a rough sizing.</p>
     <div id="recommendationsContainer"></div>
   </section>
 
   <section id="browser" class="tab-content">
-    <h2>9. Ticket Browser</h2>
+    <h2>10. Ticket Browser</h2>
     <p class="section-sub" id="browserSub">Search and filter the tickets for
     the selected reporting period. Useful for verifying any finding or pulling
     representative examples for a stakeholder discussion. Quotes are
@@ -1297,7 +1468,7 @@ function destroyCharts() {
 function clearAllDynamic() {
   ['execBullets','topIssuesContainer','topServicesContainer','svcCatTable',
    'painCardsContainer','operationalContainer','trendsContainer',
-   'recommendationsContainer','browserBody'].forEach(id => {
+   'recommendationsContainer','browserBody','verticalsCards','verticalsTable'].forEach(id => {
      const el = document.getElementById(id);
      if (el) el.innerHTML = '';
   });
@@ -1326,9 +1497,11 @@ function renderHero() {
   const topSvcN = (DATA.top_services[0] || ['—', 0])[1];
   const topSvcPct = DATA.total ? (topSvcN / DATA.total * 100) : 0;
 
+  const vSuffix = (DATA.vertical_key && DATA.vertical_key !== 'all')
+    ? ' · ' + DATA.vertical_label : '';
   document.getElementById('reportTitle').textContent =
-    'ThinkProp Support Insights — ' + DATA.period;
-  document.title = 'ThinkProp — Support Insights (' + DATA.period + ')';
+    'ThinkProp Support Insights — ' + DATA.period + vSuffix;
+  document.title = 'ThinkProp — Support Insights (' + DATA.period + vSuffix + ')';
 
   document.getElementById('kpi-total').textContent = DATA.total.toLocaleString();
   document.getElementById('kpi-total-delta').textContent =
@@ -1419,6 +1592,53 @@ charts.topSvc = new Chart(document.getElementById('topSvcChart'), {
   bullets.forEach(b => { const li = document.createElement('li'); li.innerHTML = b; ol.appendChild(li); });
 }
 
+// ---- Verticals comparison (cards + table; charts built lazily) ----
+{
+  const vs = DATA.verticals_summary || [];
+  const cardsEl = document.getElementById('verticalsCards');
+  if (cardsEl) {
+    cardsEl.className = 'grid-2';
+    cardsEl.innerHTML = vs.map(v => `
+      <div class="card" style="border-top: 4px solid ${v.color};">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap;">
+          <h3 style="margin:0;color:${v.color};">${v.label}</h3>
+          <strong style="font-family:'SF Mono',Monaco,monospace;color:${v.color};">${v.tickets.toLocaleString()} · ${v.pct.toFixed(1)}%</strong>
+        </div>
+        <p style="color:var(--muted);font-size:13px;margin:6px 0 12px;">${v.blurb}</p>
+        <div style="font-size:13px;line-height:1.85;">
+          <div><strong>Top course:</strong> ${v.top_course}${v.top_course_n ? ' ('+v.top_course_n+')' : ''}</div>
+          <div><strong>Top issue:</strong> ${v.top_issue}${v.top_issue_n ? ' ('+v.top_issue_n+')' : ''}</div>
+          <div><strong>Biggest pain:</strong> ${v.top_cat_title}</div>
+          <div><strong>Learners:</strong> ${v.users.toLocaleString()} &nbsp;·&nbsp; <strong>Avg sentiment:</strong> ${v.avg_sentiment ?? '—'}</div>
+        </div>
+        <button class="vfilter-btn" data-vert="${v.key}" style="border-color:${v.color};color:${v.color};">Filter report to ${v.label} →</button>
+      </div>
+    `).join('');
+    cardsEl.querySelectorAll('.vfilter-btn').forEach(b => b.addEventListener('click', () => {
+      const vsel = document.getElementById('vertPicker');
+      if (vsel) { vsel.value = b.dataset.vert; vsel.dispatchEvent(new Event('change')); }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }));
+  }
+  const tEl = document.getElementById('verticalsTable');
+  if (tEl) {
+    let h = '<table><thead><tr><th>Vertical</th><th class="num">Tickets</th>'
+          + '<th class="num">Share</th><th class="num">Learners</th><th>Top course</th>'
+          + '<th>Top issue</th><th>Biggest pain</th><th class="num">Avg sent.</th></tr></thead><tbody>';
+    vs.forEach(v => {
+      h += `<tr><td><span class="vchip" style="background:${v.bg};color:${v.color};">${v.label}</span></td>`
+         + `<td class="num">${v.tickets.toLocaleString()}</td>`
+         + `<td class="num">${v.pct.toFixed(1)}%</td>`
+         + `<td class="num">${v.users.toLocaleString()}</td>`
+         + `<td>${v.top_course}</td><td>${v.top_issue}</td>`
+         + `<td>${v.top_cat_title}</td>`
+         + `<td class="num">${v.avg_sentiment ?? '—'}</td></tr>`;
+    });
+    h += '</tbody></table>';
+    tEl.innerHTML = h;
+  }
+}
+
 // ---- Top issues cards ----
 {
   const el = document.getElementById('topIssuesContainer');
@@ -1477,6 +1697,42 @@ charts.topSvc = new Chart(document.getElementById('topSvcChart'), {
 // A chart created in a display:none container renders at 0x0 and resize()
 // cannot recover it, so defer creation until the tab is first shown.
 buildLazyCharts = (tabId) => {
+  if (tabId === 'verticals' && !charts.vert) {
+    const vs = DATA.verticals_summary || [];
+    charts.vert = new Chart(document.getElementById('vertChart'), {
+      type: 'bar',
+      data: {
+        labels: vs.map(v => v.label),
+        datasets: [{ data: vs.map(v => v.tickets), backgroundColor: vs.map(v => v.color) }],
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { label: ctx => {
+            const t = vs[ctx.dataIndex];
+            return `${t.label}: ${ctx.parsed.x} tickets (${t.pct.toFixed(1)}%)`;
+          } } } },
+        scales: { x: { beginAtZero: true } },
+      }
+    });
+    charts.vertCat = new Chart(document.getElementById('vertCatChart'), {
+      type: 'bar',
+      data: {
+        labels: vs.map(v => v.label),
+        datasets: catKeys.map(k => ({
+          label: DATA.pain_categories[k].title,
+          data: vs.map(v => v.breakdown[k] || 0),
+          backgroundColor: DATA.pain_categories[k].color,
+        })),
+      },
+      options: {
+        indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+        scales: { x: { stacked: true, beginAtZero: true }, y: { stacked: true } },
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } } },
+      }
+    });
+    return;
+  }
   if (tabId !== 'distribution' || charts.svcDist) return;
   charts.svcDist = new Chart(document.getElementById('svcDistChart'), {
     type: 'bar',
@@ -1665,15 +1921,28 @@ buildLazyCharts = (tabId) => {
 
 // ---- Initial wiring ----
 {
-  const picker = document.getElementById('monthPicker');
-  const urlM = new URLSearchParams(location.search).get('m');
-  const initial = (urlM && ALL_DATA[urlM]) ? urlM : DEFAULT_MONTH;
-  picker.value = initial;
-  picker.addEventListener('change', e => {
-    renderAll(e.target.value);
-    setMonthParam(e.target.value);
-  });
-  renderAll(initial);
+  const monthSel = document.getElementById('monthPicker');
+  const vertSel = document.getElementById('vertPicker');
+  const [defM, defV] = DEFAULT_MONTH.split('::');
+  const params = new URLSearchParams(location.search);
+  let m = params.get('m'); if (!m || !ALL_DATA[m + '::all']) m = defM;
+  let v = params.get('v') || defV || 'all';
+  if (!ALL_DATA[m + '::' + v]) v = 'all';      // vertical may be empty for this month
+  monthSel.value = m; vertSel.value = v;
+
+  function apply() {
+    let mm = monthSel.value, vv = vertSel.value;
+    if (!ALL_DATA[mm + '::' + vv]) { vv = 'all'; vertSel.value = 'all'; }
+    renderAll(mm + '::' + vv);
+    const u = new URL(location.href);
+    u.searchParams.set('m', mm);
+    u.searchParams.set('v', vv);
+    history.replaceState(null, '', u.toString());
+  }
+  monthSel.addEventListener('change', apply);
+  vertSel.addEventListener('change', apply);
+
+  renderAll(m + '::' + v);
   // Restore tab from URL hash, if any.
   if (location.hash) {
     const h = location.hash.replace('#','');
@@ -1694,19 +1963,21 @@ def main() -> int:
     parser.add_argument("--month", help="default month to open the report on, e.g. '2026-05'")
     args = parser.parse_args()
 
-    all_data, options, default_key = build_all_months()
+    all_data, month_options, vertical_options, default_key = build_all_months()
     if args.month:
-        if args.month not in all_data:
-            avail = [k for k, _ in options]
+        key = f"{args.month}::all"
+        if key not in all_data:
+            avail = [k for k, _ in month_options]
             raise SystemExit(f"No data for month '{args.month}'. Available: {avail}")
-        default_key = args.month
+        default_key = key
 
-    months_with_data = [k for k, _ in options if k != "all"]
-    total_all = all_data.get("all", all_data[default_key])["total"]
-    print(f"Embedding {len(months_with_data)} month(s) + 'all' view "
-          f"(total {total_all:,} tickets after noise filtering). Default: {default_key}.")
+    months_with_data = [k for k, _ in month_options if k != "all"]
+    total_all = all_data[default_key]["total"]
+    print(f"Embedding {len(all_data)} blocks "
+          f"({len(months_with_data)} month(s) × {len(vertical_options)} verticals). "
+          f"Default: {default_key}, {total_all:,} tickets.")
 
-    html_str = render_html(all_data, options, default_key)
+    html_str = render_html(all_data, month_options, vertical_options, default_key)
 
     OUT_HTML.parent.mkdir(parents=True, exist_ok=True)
     OUT_HTML.write_text(html_str, encoding="utf-8")
